@@ -1,41 +1,61 @@
 ---
+# These are the fields required to setup, build, and run tests in the jenkins job
+jenkins_ci:
+  # This is information about the build environment such as the language
+  machine:
+    # The supported languages are java, go, node
+    language: "go"
+  # These are the commands needed to setup the environment before building or testing
+  # setup_commands:
+
+  build_commands:
+    - "make"
+
+  unit_test:
+    - "go test ./communication ./discovery ./storage ./raft"
+  # functional tests
+  functional_tests:
+    - "go test ./agent"
+
 # NOTE:
 # As with the rest of the files in this repo, you can sub out ${APP_NAME} for what ever works when testing locally.
 # ${APP_NAME} is required for the jenkins job.
 
-# REQUIRED: The name of the application
-name: changeagent
-description: A distributed change log
-version: 1.0.0
-type: app
+rpm_info:
 
-# REQUIRED: This is the location of the binary with respect to the docker container
-bin: /agent
+  # REQUIRED: The name of the application
+  name: changeagent
+  description: A distributed change log
+  version: 1.0.0
+  type: app
 
-# REQUIRED: This is the command to run the binary with respect to the docker container
-# Generally the value of CMD in the Dockerfile
-start: /agent
+  # REQUIRED: This is the location of the binary with respect to the docker container
+  bin: /agent
 
-# NOTE: Below this comment are other field that can be specified
-# these are the spaces separate arguements that you would use with a base start command
-# For example, "./asf-go-example" would be run as "./asf-go-example ARG1"
-#
-start_args: "-logtostderr -p 8080 -d /var/changeagent/data"
+  # REQUIRED: This is the command to run the binary with respect to the docker container
+  # Generally the value of CMD in the Dockerfile
+  start: /agent
 
-# These dependecies have to be able to be compatible with "yum install <comp>"
-#
-# depends:
-#  - nodejs = 4.4.4-1nodesource.el7.centos
-#  - npm
+  # NOTE: Below this comment are other field that can be specified
+  # these are the spaces separate arguements that you would use with a base start command
+  # For example, "./asf-go-example" would be run as "./asf-go-example ARG1"
+  #
+  start_args: "-logtostderr -p 8080 -d /var/changeagent/data"
 
-# environment variables needed by the application
-# VAR1 will assume the user supplies the variable beforehand
-# VAR1=HELLO will set the variable when the application runs
-#
-# env:
-#  - DB_NAME=database
-#  - DB_USER=admin
-#  - DB_PASS=password
-#  - SPECHUB_DB_NAME=spechub
-#  - SPECHUB_DB_PASS=spechub
-#  - RANDOM=TEST
+  # These dependecies have to be able to be compatible with "yum install <comp>"
+  #
+  # depends:
+  #  - nodejs = 4.4.4-1nodesource.el7.centos
+  #  - npm
+
+  # environment variables needed by the application
+  # VAR1 will assume the user supplies the variable beforehand
+  # VAR1=HELLO will set the variable when the application runs
+  #
+  # env:
+  #  - DB_NAME=database
+  #  - DB_USER=admin
+  #  - DB_PASS=password
+  #  - SPECHUB_DB_NAME=spechub
+  #  - SPECHUB_DB_PASS=spechub
+  #  - RANDOM=TEST
