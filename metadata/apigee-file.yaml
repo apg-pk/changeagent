@@ -7,7 +7,7 @@ jenkins_ci:
     language: "go"
   # These are the commands needed to setup the environment before building or testing
   setup_commands:
-    - "yum install -y gcc"
+    - "sudo yum install -y gcc"
     - "go get github.com/Masterminds/glide"
     - "glide install"
 
