@@ -6,7 +6,9 @@ jenkins_ci:
     # The supported languages are java, go, node
     language: "go"
   # These are the commands needed to setup the environment before building or testing
-  # setup_commands:
+  setup_commands:
+    - "go get github.com/Masterminds/glide"
+    - "glide install"
 
   build_commands:
     - "make"
