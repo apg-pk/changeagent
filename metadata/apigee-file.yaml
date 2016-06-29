@@ -7,8 +7,10 @@ jenkins_ci:
     language: "go"
   setup_commands:
     # setup commands not needed here, handled in Dockerfile
+    - "echo nothing to setup here"
   build_commands:
     # build commands not needed here, handled in Dockerfile
+    - "echo nothing to build here"
   unit_test:
     - "go test ./communication ./discovery ./storage ./raft"
   # functional tests
