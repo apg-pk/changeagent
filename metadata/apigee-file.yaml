@@ -24,7 +24,6 @@ jenkins_ci:
 # ${APP_NAME} is required for the jenkins job.
 
 rpm_info:
-
   # REQUIRED: The name of the application
   name: changeagent
   description: A distributed change log
