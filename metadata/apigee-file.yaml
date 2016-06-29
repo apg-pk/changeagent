@@ -5,13 +5,13 @@ jenkins_ci:
   machine:
     # The supported languages are java, go, node
     language: "go"
-  # These are the commands needed to setup the environment before building or testing
-  setup_commands:
-    - "sudo yum install -y gcc"
-    - "go get github.com/Masterminds/glide"
-
-  build_commands:
-    - "make"
+  # Setup/Build commands not needed here, handled in Dockerfile
+  #  setup_commands:
+  #    - "sudo yum install -y gcc"
+  #    - "go get github.com/Masterminds/glide"
+  #
+  #  build_commands:
+  #    - "make"
 
   unit_test:
     - "go test ./communication ./discovery ./storage ./raft"
