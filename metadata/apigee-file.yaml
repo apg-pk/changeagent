@@ -9,7 +9,6 @@ jenkins_ci:
   setup_commands:
     - "sudo yum install -y gcc"
     - "go get github.com/Masterminds/glide"
-    - "glide install"
 
   build_commands:
     - "make"
