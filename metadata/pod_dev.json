@@ -12,12 +12,10 @@
 		}
 	},
 	"spec": {
-		"imagePullSecrets": [{
-			"name": "ecr-key"
-		}],
 		"containers": [{
 			"name": "changeagent",
-			"image": "${IMAGE_URL}:latest",
+			"image": "changeagent:latest",
+			"imagePullPolicy": "Never",
 			"ports": [{
 				"containerPort": 8080
 			}]
