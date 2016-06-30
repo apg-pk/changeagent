@@ -7,7 +7,7 @@
         "component": "${APP_NAME}"
     },
 		"annotations": {
-			"publicPaths": "8080:/changes",
+			"publicPaths": "8080:/changeagent",
 			"projectcalico.org/policy": "allow tcp"
 		}
 	},
