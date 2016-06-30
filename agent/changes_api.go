@@ -16,7 +16,7 @@ const (
 	defaultLimit = "100"
 	defaultBlock = "0"
 
-	changesURI   = "/changes"
+	changesURI   = "/changeagent/changes"
 	singleChange = changesURI + "/{change}"
 )
 
