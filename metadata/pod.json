@@ -2,12 +2,12 @@
 	"apiVersion": "v1",
 	"kind": "Pod",
 	"metadata": {
-		"name": "changeagent",
+		"name": "${APP_NAME}",
     "labels": {
-        "app": "changeagent"
+        "component": "${APP_NAME}"
     },
 		"annotations": {
-      "publicPaths": "8080:/changes",
+			"publicPaths": "8080:/changes",
 			"projectcalico.org/policy": "allow tcp"
 		}
 	},
@@ -16,7 +16,7 @@
 			"name": "ecr-key"
 		}],
 		"containers": [{
-			"name": "changeagent",
+			"name": "${APP_NAME}",
 			"image": "${IMAGE_URL}:latest",
 			"ports": [{
 				"containerPort": 8080

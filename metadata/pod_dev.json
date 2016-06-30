@@ -4,10 +4,10 @@
 	"metadata": {
 		"name": "changeagent",
     "labels": {
-        "app": "changeagent"
+        "component": "changeagent"
     },
 		"annotations": {
-      "publicPaths": "8080:/changes",
+			"publicPaths": "8080:/changes",
 			"projectcalico.org/policy": "allow tcp"
 		}
 	},
