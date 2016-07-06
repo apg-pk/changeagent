@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"net/http"
+	"regexp"
 	"time"
 
 	"github.com/30x/changeagent/communication"
@@ -18,9 +19,10 @@ ChangeAgent is a server that implements the Raft protocol, plus the "changeagent
 API.
 */
 type ChangeAgent struct {
-	stor   storage.Storage
-	raft   *raft.Service
-	router *mux.Router
+	stor      storage.Storage
+	raft      *raft.Service
+	router    *mux.Router
+	uriPrefix string
 }
 
 const (
@@ -31,8 +33,8 @@ const (
 	commitTimeoutSeconds = 10
 	dbCacheSize          = 10 * 1024 * 1024
 
-	jsonContent      = "application/json"
 	plainTextContent = "text/plain"
+	jsonContent      = "application/json"
 )
 
 /*
@@ -43,10 +45,25 @@ HTTP "mux".
 
 "httpMux" must have been previously created using the "net/http" package,
 and it must listen for HTTP requests.
+
+If "uriPrefix" is not the empty string, then every API call will require that
+it be prepended. In other words, "/changes" will become "/prefix/changes".
+The prefix must not end with a "/".
 */
 func StartChangeAgent(disco discovery.Discovery,
 	dbFile string,
-	httpMux *http.ServeMux) (*ChangeAgent, error) {
+	httpMux *http.ServeMux,
+	uriPrefix string) (*ChangeAgent, error) {
+
+	if uriPrefix != "" {
+		if uriPrefix[len(uriPrefix)-1] == '/' {
+			return nil, errors.New("Invalid URI prefix: Must not end with a slash")
+		}
+		if uriPrefix[0] != '/' {
+			uriPrefix = "/" + uriPrefix
+		}
+	}
+
 	comm, err := communication.StartHTTPCommunication(httpMux)
 	if err != nil {
 		return nil, err
@@ -57,8 +74,9 @@ func StartChangeAgent(disco discovery.Discovery,
 	}
 
 	agent := &ChangeAgent{
-		stor:   stor,
-		router: mux.NewRouter(),
+		stor:      stor,
+		router:    mux.NewRouter(),
+		uriPrefix: uriPrefix,
 	}
 
 	raft, err := raft.StartRaft(comm, disco, stor, agent)
@@ -68,8 +86,9 @@ func StartChangeAgent(disco discovery.Discovery,
 	agent.raft = raft
 	comm.SetRaft(raft)
 
-	agent.initDiagnosticAPI()
-	agent.initChangesAPI()
+	agent.initDiagnosticAPI(uriPrefix)
+	agent.initChangesAPI(uriPrefix)
+	agent.initHooksAPI(uriPrefix)
 
 	httpMux.Handle("/", agent.router)
 
@@ -111,18 +130,26 @@ func (a *ChangeAgent) makeProposal(proposal storage.Entry) (storage.Entry, error
 	}
 	glog.V(2).Infof("Proposed new change with index %d", newIndex)
 
-	// Wait for the new commit to be applied, or time out
-	appliedIndex :=
-		a.raft.GetAppliedTracker().TimedWait(newIndex, time.Second*commitTimeoutSeconds)
-	glog.V(2).Infof("New index %d is now applied", appliedIndex)
-	if appliedIndex >= newIndex {
+	err = a.waitForCommit(newIndex)
+	if err == nil {
 		newEntry := storage.Entry{
 			Index: newIndex,
 		}
 		return newEntry, nil
 	}
 
-	return storage.Entry{}, errors.New("Commit timeout")
+	return storage.Entry{}, err
+}
+
+// Wait for the new commit to be applied, or time out
+func (a *ChangeAgent) waitForCommit(ix uint64) error {
+	appliedIndex :=
+		a.raft.GetAppliedTracker().TimedWait(ix, time.Second*commitTimeoutSeconds)
+	glog.V(2).Infof("New index %d is now applied", appliedIndex)
+	if appliedIndex < ix {
+		return errors.New("Commit timeout")
+	}
+	return nil
 }
 
 /*
@@ -140,4 +167,14 @@ func writeError(resp http.ResponseWriter, code int, err error) {
 	resp.Header().Set("Content-Type", jsonContent)
 	resp.WriteHeader(code)
 	resp.Write([]byte(msg))
+}
+
+var jsonContentRe = regexp.MustCompile("^application/json(;.*)?$")
+
+func isJSON(resp http.ResponseWriter, req *http.Request) bool {
+	if !jsonContentRe.MatchString(req.Header.Get("Content-Type")) {
+		writeError(resp, http.StatusUnsupportedMediaType, errors.New("Unsupported content type"))
+		return false
+	}
+	return true
 }

@@ -10,8 +10,10 @@ import (
 
 const (
 	// DiscoveryInterval is the amount of time that the discovery service checks
-	// for new changes.
-	DiscoveryInterval   = 5 * time.Second
+	// for new changes when it does not have all the nodes discovered.
+	DiscoveryInterval = 5 * time.Second
+	// RediscoveryInterval is the amount of time between re-scans of the existing
+	// nodes to make sure that none of them have been replaced.
 	RediscoveryInterval = time.Hour
 )
 
@@ -22,7 +24,7 @@ const (
  */
 
 type nodeDiscovery struct {
-	discovered map[uint64]string
+	discovered map[communication.NodeID]string
 	disco      discovery.Discovery
 	comm       communication.Communication
 	raft       *Service
@@ -33,7 +35,7 @@ func startNodeDiscovery(disco discovery.Discovery,
 	comm communication.Communication,
 	raft *Service) *nodeDiscovery {
 	nd := nodeDiscovery{
-		discovered: make(map[uint64]string),
+		discovered: make(map[communication.NodeID]string),
 		disco:      disco,
 		comm:       comm,
 		raft:       raft,

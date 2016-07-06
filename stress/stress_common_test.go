@@ -23,7 +23,7 @@ type RaftState struct {
 }
 
 func launchAgent(port int, dataDir string) (*os.Process, error) {
-	cmd := exec.Command("../agent/agent")
+	cmd := exec.Command("../changeagent")
 	args := []string{
 		"../agent/agent",
 		"-s", "./tmpdisco",
@@ -74,7 +74,7 @@ func getRaftState(port int, maxWait int) (string, uint64, error) {
 				if err != nil {
 					return "", 0, err
 				}
-				leaderID, err := strconv.ParseUint(state.Leader, 10, 64)
+				leaderID, err := strconv.ParseUint(state.Leader, 16, 64)
 				if err != nil {
 					return "", 0, err
 				}
@@ -89,7 +89,7 @@ func getRaftState(port int, maxWait int) (string, uint64, error) {
 		time.Sleep(time.Second)
 	}
 
-	return "", 0, fmt.Errorf("Raft peer bad status %d after %d seconds: code = %d err = %s",
+	return "", 0, fmt.Errorf("Raft peer bad status %s after %d seconds: code = %d err = %s",
 		lastStatus, maxWait, lastCode, lastErr)
 }
 

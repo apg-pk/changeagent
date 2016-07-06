@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/30x/changeagent/communication"
 	"github.com/30x/changeagent/discovery"
 	"github.com/30x/changeagent/storage"
 	"github.com/golang/glog"
@@ -27,14 +28,14 @@ type peerMatchResult struct {
 }
 
 type raftState struct {
-	votedFor           uint64
+	votedFor           communication.NodeID
 	voteIndex          uint64 // Keep track of the voting channel in case something takes a long time
 	voteResults        chan voteResult
 	peers              map[string]*raftPeer
 	peerMatches        map[string]uint64
 	peerMatchChanges   chan peerMatchResult
 	proposedConfig     *discovery.NodeConfig
-	configChangeMode   int
+	configChangeMode   MembershipChangeMode
 	configChangeCommit uint64
 }
 
@@ -46,27 +47,27 @@ func (r *Service) mainLoop() {
 		peers:            make(map[string]*raftPeer),
 		peerMatches:      make(map[string]uint64),
 		peerMatchChanges: make(chan peerMatchResult, 1),
-		configChangeMode: noChange,
+		configChangeMode: Stable,
 	}
 
 	var stopDone chan bool
 	for {
 		switch r.GetState() {
 		case Follower:
-			glog.Infof("Node %d entering follower mode", r.id)
+			glog.Infof("Node %s entering follower mode", r.id)
 			stopDone = r.followerLoop(false, state)
 		case Candidate:
-			glog.Infof("Node %d entering candidate mode", r.id)
+			glog.Infof("Node %s entering candidate mode", r.id)
 			stopDone = r.followerLoop(true, state)
 		case Leader:
-			glog.Infof("Node %d entering leader mode", r.id)
+			glog.Infof("Node %s entering leader mode", r.id)
 			stopDone = r.leaderLoop(state)
 		case Stopping:
 			r.cleanup()
 			if stopDone != nil {
 				stopDone <- true
 			}
-			glog.V(2).Infof("Node %d stop is complete", r.id)
+			glog.V(2).Infof("Node %s stop is complete", r.id)
 			return
 		case Stopped:
 			return
@@ -76,7 +77,7 @@ func (r *Service) mainLoop() {
 
 func (r *Service) followerLoop(isCandidate bool, state *raftState) chan bool {
 	if isCandidate {
-		glog.V(2).Infof("Node %d starting an election", r.id)
+		glog.V(2).Infof("Node %s starting an election", r.id)
 		state.voteIndex++
 		// Update term and vote for myself
 		r.setCurrentTerm(r.GetCurrentTerm() + 1)
@@ -89,7 +90,7 @@ func (r *Service) followerLoop(isCandidate bool, state *raftState) chan bool {
 	for {
 		select {
 		case <-timeout.C:
-			glog.V(2).Infof("Node %d: election timeout", r.id)
+			glog.V(2).Infof("Node %s: election timeout", r.id)
 			if !r.followerOnly {
 				r.setState(Candidate)
 				r.setLeaderID(0)
@@ -106,7 +107,7 @@ func (r *Service) followerLoop(isCandidate bool, state *raftState) chan bool {
 		case appendCmd := <-r.appendCommands:
 			// 5.1: If RPC request or response contains term T > currentTerm:
 			// set currentTerm = T, convert to follower
-			glog.V(2).Infof("Processing append command from leader %d", appendCmd.ar.LeaderID)
+			glog.V(2).Infof("Processing append command from leader %s", appendCmd.ar.LeaderID)
 			if appendCmd.ar.Term > r.GetCurrentTerm() {
 				glog.Infof("Append request from new leader at new term %d", appendCmd.ar.Term)
 				r.setCurrentTerm(appendCmd.ar.Term)
@@ -115,7 +116,7 @@ func (r *Service) followerLoop(isCandidate bool, state *raftState) chan bool {
 				r.setState(Follower)
 				r.setLeaderID(appendCmd.ar.LeaderID)
 			} else if r.GetLeaderID() == 0 {
-				glog.Infof("Seeing new leader %d for the first time", appendCmd.ar.LeaderID)
+				glog.Infof("Seeing new leader %s for the first time", appendCmd.ar.LeaderID)
 				r.setLeaderID(appendCmd.ar.LeaderID)
 			}
 			r.handleAppend(state, appendCmd)
@@ -130,12 +131,12 @@ func (r *Service) followerLoop(isCandidate bool, state *raftState) chan bool {
 				prop.rc <- pr
 			} else {
 				go func() {
-					glog.V(2).Infof("Forwarding proposal to leader node %d", leaderID)
+					glog.V(2).Infof("Forwarding proposal to leader node %s", leaderID)
 					leaderAddr := r.getNodeAddress(leaderID)
 
 					pr := proposalResult{}
 					if leaderAddr == "" {
-						pr.err = fmt.Errorf("No address known for leader node %d", leaderID)
+						pr.err = fmt.Errorf("No address known for leader node %s", leaderID)
 					} else {
 						fr, err := r.comm.Propose(leaderAddr, prop.entry)
 						if err != nil {
@@ -154,7 +155,7 @@ func (r *Service) followerLoop(isCandidate bool, state *raftState) chan bool {
 				// Avoid vote results that come back way too late
 				state.votedFor = 0
 				r.writeLastVote(0)
-				glog.V(2).Infof("Node %d received the election result: %v", r.id, vr.result)
+				glog.V(2).Infof("Node %s received the election result: %v", r.id, vr.result)
 				if vr.result {
 					r.setState(Leader)
 					r.setLeaderID(0)
@@ -167,6 +168,9 @@ func (r *Service) followerLoop(isCandidate bool, state *raftState) chan bool {
 		case <-r.configChanges:
 			glog.V(2).Info("Node configuration changed. Waiting for a push from the leader.")
 
+		case si := <-r.statusInquiries:
+			returnStatus(si, state, false)
+
 		case stopDone := <-r.stopChan:
 			r.setState(Stopping)
 			return stopDone
@@ -176,7 +180,7 @@ func (r *Service) followerLoop(isCandidate bool, state *raftState) chan bool {
 
 func (r *Service) leaderLoop(state *raftState) chan bool {
 	// Get the list of nodes here from the current configuration.
-	nodes := r.getNodeConfig().GetUniqueNodes()
+	nodes := r.GetNodeConfig().GetUniqueNodes()
 	for _, node := range nodes {
 		state.peers[node] = startPeer(node, r, state.peerMatchChanges)
 		state.peerMatches[node] = 0
@@ -197,7 +201,7 @@ func (r *Service) leaderLoop(state *raftState) chan bool {
 	}
 
 	discoConfig := r.disco.GetCurrentConfig()
-	if !discoConfig.Current.Equal(r.getNodeConfig().Current) {
+	if !discoConfig.Current.Equal(r.GetNodeConfig().Current) {
 		err := r.processConfigChange(state)
 		if err != nil {
 			// Should we panic now? Set a state to retry?
@@ -229,13 +233,23 @@ func (r *Service) leaderLoop(state *raftState) chan bool {
 			r.handleAppend(state, appendCmd)
 
 		case prop := <-r.proposals:
-			// If command received from client: append entry to local log,
-			// respond after entry applied to state machine (§5.3)
-			index, err := r.makeProposal(&prop.entry, state)
-			if len(state.peers) == 0 {
-				// Special handling for a stand-alone node
-				r.setCommitIndex(index)
-				r.applyCommittedEntries(index)
+			// First check the webhooks and reply immediately if this fails
+			if prop.entry.Type >= 0 {
+				err = r.invokeWebHooks(&prop.entry)
+			} else {
+				err = nil
+			}
+
+			var index uint64
+			if err == nil {
+				// If command received from client: append entry to local log,
+				// respond after entry applied to state machine (§5.3)
+				index, err = r.makeProposal(&prop.entry, state)
+				if len(state.peers) == 0 {
+					// Special handling for a stand-alone node
+					r.setCommitIndex(index)
+					r.applyCommittedEntries(index)
+				}
 			}
 			pr := proposalResult{
 				index: index,
@@ -247,7 +261,7 @@ func (r *Service) leaderLoop(state *raftState) chan bool {
 			// Got back a changed applied index from a peer. Decide if we have a commit and
 			// process it if we do.
 			state.peerMatches[peerMatch.address] = peerMatch.newMatch
-			newIndex := r.calculateCommitIndex(state, r.getNodeConfig())
+			newIndex := r.calculateCommitIndex(state, r.GetNodeConfig())
 			if r.setCommitIndex(newIndex) {
 				r.applyCommittedEntries(newIndex)
 				for _, p := range state.peers {
@@ -267,6 +281,9 @@ func (r *Service) leaderLoop(state *raftState) chan bool {
 			if err != nil {
 				glog.Errorf("Error processing configuration change: %v", err)
 			}
+
+		case si := <-r.statusInquiries:
+			returnStatus(si, state, true)
 
 		case stopDone := <-r.stopChan:
 			r.setState(Stopping)
@@ -311,7 +328,7 @@ func (r *Service) processConfigChange(state *raftState) error {
 	// Persist the new config and start using it for subsequent communications
 	r.setNodeConfig(newCfg)
 	state.configChangeCommit = ix
-	state.configChangeMode = proposedJointConsensus
+	state.configChangeMode = ProposedJointConsensus
 
 	r.updatePeerList(newCfg, state)
 
@@ -324,7 +341,7 @@ func (r *Service) processConfigChange(state *raftState) error {
 func (r *Service) updateConfigChange(commitIndex uint64, state *raftState) error {
 	switch state.configChangeMode {
 
-	case proposedJointConsensus:
+	case ProposedJointConsensus:
 		if commitIndex < state.configChangeCommit {
 			return nil
 		}
@@ -350,16 +367,16 @@ func (r *Service) updateConfigChange(commitIndex uint64, state *raftState) error
 		// Don't use the new config yet -- wait for it to commit.
 		state.proposedConfig = newCfg
 		state.configChangeCommit = ix
-		state.configChangeMode = proposedFinalConsensus
+		state.configChangeMode = ProposedFinalConsensus
 
-	case proposedFinalConsensus:
+	case ProposedFinalConsensus:
 		if commitIndex < state.configChangeCommit {
 			return nil
 		}
 		glog.Info("Final consensus proposal successful. Configuration change complete.")
 		// Final consensus was reached. Now we can start using the new config exclusively.
 		r.setNodeConfig(state.proposedConfig)
-		state.configChangeMode = noChange
+		state.configChangeMode = Stable
 
 		r.updatePeerList(state.proposedConfig, state)
 
@@ -372,7 +389,7 @@ func (r *Service) updateConfigChange(commitIndex uint64, state *raftState) error
  * joint consensus.
  */
 func (r *Service) makeJointConsensus() *discovery.NodeConfig {
-	oldCfg := r.getNodeConfig()
+	oldCfg := r.GetNodeConfig()
 	newCfg := r.disco.GetCurrentConfig()
 	newCfg.Current.Old = oldCfg.Current.New
 	newCfg.Previous = oldCfg.Current
@@ -383,7 +400,7 @@ func (r *Service) makeJointConsensus() *discovery.NodeConfig {
  * Turn a joint consensus entry into a final entry.
  */
 func (r *Service) makeFinalConsensus() *discovery.NodeConfig {
-	oldCfg := r.getNodeConfig()
+	oldCfg := r.GetNodeConfig()
 	newCfg := discovery.NodeConfig{
 		Previous: oldCfg.Current,
 		Current: &discovery.NodeList{
@@ -483,4 +500,18 @@ func (r *Service) getPartialCommitIndex(state *raftState, nodes []string) uint64
 	// Since indices are zero-based, this will return element N / 2 + 1
 	p := len(indices) / 2
 	return indices[p]
+}
+
+func returnStatus(ch chan<- ProtocolStatus, state *raftState, isLeader bool) {
+	s := ProtocolStatus{
+		ChangeMode: state.configChangeMode,
+	}
+	if isLeader {
+		pis := make(map[string]uint64)
+		for k, v := range state.peerMatches {
+			pis[k] = v
+		}
+		s.PeerIndices = &pis
+	}
+	ch <- s
 }

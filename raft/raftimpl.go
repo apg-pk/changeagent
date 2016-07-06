@@ -1,7 +1,10 @@
 package raft
 
 import (
+	cryptoRand "crypto/rand"
 	"errors"
+	"math"
+	"math/big"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -9,6 +12,7 @@ import (
 
 	"github.com/30x/changeagent/communication"
 	"github.com/30x/changeagent/discovery"
+	"github.com/30x/changeagent/hooks"
 	"github.com/30x/changeagent/storage"
 	"github.com/golang/glog"
 )
@@ -23,12 +27,15 @@ const (
 	LocalIDKey     = "localID"
 	LastAppliedKey = "lastApplied"
 	NodeConfig     = "nodeConfig"
+	WebHooks       = "webHooks"
 )
 
 const (
-	// MembershipChange denodes a special message type for membership changes.
-	//Also persists between nodes.
+	// MembershipChange denotes a special message type for membership changes.
 	MembershipChange = -1
+	// WebHookChange denotes a change in the WebHook configuration for the
+	// cluster.
+	WebHookChange = -2
 
 	// ElectionTimeout is the amount of time a node will wait once it has heard
 	// from the current leader before it declares itself a candidate.
@@ -37,10 +44,14 @@ const (
 	// HeartbeatTimeout is the amount of time between heartbeat messages from the
 	// leader to other nodes.
 	HeartbeatTimeout = 2 * time.Second
+
+	jsonContent = "application/json"
 )
 
 // State is the current state of the Raft implementation.
 type State int32
+
+//go:generate stringer -type State .
 
 /*
  * State of this particular node.
@@ -53,32 +64,19 @@ const (
 	Stopped
 )
 
+// MembershipChangeMode is the state of the current membership change process
+type MembershipChangeMode int32
+
+//go:generate stringer -type MembershipChangeMode .
+
 /*
  * State of the current membership change process
  */
 const (
-	noChange = iota
-	proposedJointConsensus
-	proposedFinalConsensus
+	Stable MembershipChangeMode = iota
+	ProposedJointConsensus
+	ProposedFinalConsensus
 )
-
-// TODO this should use "stringer."
-func (r State) String() string {
-	switch r {
-	case Follower:
-		return "Follower"
-	case Candidate:
-		return "Candidate"
-	case Leader:
-		return "Leader"
-	case Stopping:
-		return "Stopping"
-	case Stopped:
-		return "Stopped"
-	default:
-		return ""
-	}
-}
 
 /*
 Service is an instance of code that implements the Raft protocol.
@@ -86,7 +84,7 @@ It relies on the Storage, Discovery, and Communication services to do
 its work, and invokes the StateMachine when changes are committed.
 */
 type Service struct {
-	id                  uint64
+	id                  communication.NodeID
 	localAddress        atomic.Value
 	state               int32
 	leaderID            uint64
@@ -100,8 +98,9 @@ type Service struct {
 	voteCommands        chan voteCommand
 	appendCommands      chan appendCommand
 	proposals           chan proposalCommand
-	discoveredNodes     map[uint64]string
-	discoveredAddresses map[string]uint64
+	statusInquiries     chan chan<- ProtocolStatus
+	discoveredNodes     map[communication.NodeID]string
+	discoveredAddresses map[string]communication.NodeID
 	latch               sync.Mutex
 	followerOnly        bool
 	currentTerm         uint64
@@ -111,6 +110,18 @@ type Service struct {
 	lastTerm            uint64
 	appliedTracker      *ChangeTracker
 	stateMachine        StateMachine
+	webHooks            atomic.Value
+}
+
+/*
+ProtocolStatus returns some of the diagnostic information from the raft engine.
+*/
+type ProtocolStatus struct {
+	// Status of the membership change process
+	ChangeMode MembershipChangeMode
+	// If this node is the leader, a map of the indices of each peer.
+	// Otherwise nil.
+	PeerIndices *map[string]uint64
 }
 
 type voteCommand struct {
@@ -155,13 +166,15 @@ func StartRaft(comm communication.Communication,
 		stopChan:            make(chan chan bool, 1),
 		voteCommands:        make(chan voteCommand, 1),
 		appendCommands:      make(chan appendCommand, 1),
+		statusInquiries:     make(chan chan<- ProtocolStatus, 1),
 		proposals:           make(chan proposalCommand, 100),
-		discoveredNodes:     make(map[uint64]string),
-		discoveredAddresses: make(map[string]uint64),
+		discoveredNodes:     make(map[communication.NodeID]string),
+		discoveredAddresses: make(map[string]communication.NodeID),
 		latch:               sync.Mutex{},
 		followerOnly:        false,
 		appliedTracker:      CreateTracker(),
 		stateMachine:        state,
+		webHooks:            atomic.Value{},
 	}
 
 	nodeID, err := stor.GetUintMetadata(LocalIDKey)
@@ -170,18 +183,20 @@ func StartRaft(comm communication.Communication,
 	}
 	if nodeID == 0 {
 		// Generate a random node ID
-		raftRandLock.Lock()
-		nodeID = uint64(raftRand.Int63())
-		raftRandLock.Unlock()
+		nodeID = uint64(randomInt64())
 		err = stor.SetUintMetadata(LocalIDKey, nodeID)
 		if err != nil {
 			return nil, err
 		}
 	}
-	r.id = nodeID
-	glog.Infof("Node %d starting", r.id)
+	r.id = communication.NodeID(nodeID)
+	glog.Infof("Node %s starting", r.id)
 
 	err = r.loadCurrentConfig(disco, stor)
+	if err != nil {
+		return nil, err
+	}
+	err = r.loadWebHooks(stor)
 	if err != nil {
 		return nil, err
 	}
@@ -215,10 +230,11 @@ func (r *Service) loadCurrentConfig(disco discovery.Discovery, stor storage.Stor
 		return err
 	}
 
-	if buf == nil {
-		glog.Info("Loading configuration from the discovery file for the first time")
+	if buf == nil || disco.IsStandalone() {
+		glog.Info("Loading node configuration for the first time")
 		cfg := disco.GetCurrentConfig()
-		storBuf, err := discovery.EncodeConfig(cfg)
+		var storBuf []byte
+		storBuf, err = discovery.EncodeConfig(cfg)
 		if err != nil {
 			return err
 		}
@@ -235,6 +251,24 @@ func (r *Service) loadCurrentConfig(disco discovery.Discovery, stor storage.Stor
 		return err
 	}
 	r.nodeConfig.Store(cfg)
+	return nil
+}
+
+func (r *Service) loadWebHooks(stor storage.Storage) error {
+	buf, err := stor.GetMetadata(WebHooks)
+	if err != nil {
+		return err
+	}
+
+	var webHooks []hooks.WebHook
+	if buf != nil {
+		webHooks, err = hooks.DecodeHooks(buf)
+		if err != nil {
+			return err
+		}
+	}
+
+	r.webHooks.Store(webHooks)
 	return nil
 }
 
@@ -331,7 +365,8 @@ func (r *Service) Propose(e storage.Entry) (uint64, error) {
 		rc:    rc,
 	}
 
-	glog.V(2).Infof("Going to propose a value of %d bytes", len(e.Data))
+	glog.V(2).Infof("Going to propose a value of %d bytes and type %d",
+		len(e.Data), e.Type)
 	r.proposals <- cmd
 
 	result := <-rc
@@ -341,7 +376,7 @@ func (r *Service) Propose(e storage.Entry) (uint64, error) {
 /*
 MyID returns the unique ID of this Raft node.
 */
-func (r *Service) MyID() uint64 {
+func (r *Service) MyID() communication.NodeID {
 	return r.id
 }
 
@@ -354,7 +389,7 @@ func (r *Service) GetState() State {
 }
 
 func (r *Service) setState(newState State) {
-	glog.V(2).Infof("Node %d: setting state to %d", r.id, newState)
+	glog.V(2).Infof("Node %s: setting state to %d", r.id, newState)
 	ns := int32(newState)
 	atomic.StoreInt32(&r.state, ns)
 }
@@ -363,17 +398,17 @@ func (r *Service) setState(newState State) {
 GetLeaderID returns the unique ID of the leader node, or zero if there is
 currently no known leader.
 */
-func (r *Service) GetLeaderID() uint64 {
-	return atomic.LoadUint64(&r.leaderID)
+func (r *Service) GetLeaderID() communication.NodeID {
+	return communication.NodeID(atomic.LoadUint64(&r.leaderID))
 }
 
-func (r *Service) setLeaderID(newID uint64) {
+func (r *Service) setLeaderID(newID communication.NodeID) {
 	if newID == 0 {
-		glog.V(2).Infof("Node %d: No leader present", r.id)
+		glog.V(2).Infof("Node %s: No leader present", r.id)
 	} else {
-		glog.V(2).Infof("Node %d: Node %d is now the leader", r.id, newID)
+		glog.V(2).Infof("Node %s: Node %d is now the leader", r.id, newID)
 	}
-	atomic.StoreUint64(&r.leaderID, newID)
+	atomic.StoreUint64(&r.leaderID, uint64(newID))
 }
 
 /*
@@ -415,6 +450,11 @@ func (r *Service) GetLastApplied() uint64 {
 	return atomic.LoadUint64(&r.lastApplied)
 }
 
+/*
+This is where we finally apply the changes. Some changes are purely internal,
+so we handle them here. Note that node configuration changes were handled
+elsewhere.
+*/
 func (r *Service) setLastApplied(t uint64) {
 	entry, err := r.stor.GetEntry(t)
 	if err != nil {
@@ -426,7 +466,11 @@ func (r *Service) setLastApplied(t uint64) {
 		return
 	}
 
-	if entry.Type >= 0 {
+	switch t := entry.Type; {
+	case t == WebHookChange:
+		r.applyWebHookChange(entry)
+
+	case t >= 0:
 		// Only pass positive (or zero) entry types to the state machine.
 		err = r.stateMachine.Commit(entry)
 		if err != nil {
@@ -444,6 +488,17 @@ func (r *Service) setLastApplied(t uint64) {
 	atomic.StoreUint64(&r.lastApplied, t)
 
 	r.appliedTracker.Update(t)
+}
+
+func (r *Service) applyWebHookChange(entry *storage.Entry) {
+	hooks, err := hooks.DecodeHooksJSON(entry.Data)
+	if err != nil {
+		glog.Errorf("Error receiving web hook change data")
+		return
+	}
+
+	glog.Info("Updating the web hook configuration on the server")
+	r.setWebHooks(hooks)
 }
 
 /*
@@ -474,7 +529,46 @@ func (r *Service) setLastIndex(ix uint64, term uint64) {
 	r.lastTerm = term
 }
 
-func (r *Service) getNodeConfig() *discovery.NodeConfig {
+/*
+GetFirstIndex returns the lowest index that exists in the local raft log.
+*/
+func (r *Service) GetFirstIndex() (uint64, error) {
+	return r.stor.GetFirstIndex()
+}
+
+/*
+GetRaftStatus returns some status information about the Raft engine that requires
+us to access internal state.
+*/
+func (r *Service) GetRaftStatus() ProtocolStatus {
+	ch := make(chan ProtocolStatus)
+	r.statusInquiries <- ch
+	return <-ch
+}
+
+/*
+UpdateWebHooks updates the configuration of web hooks for the cluster by
+propagating a special change record to all the nodes. A web hook is a
+particular web service URI that the leader will invoke before trying to commit any
+new change -- if any one of the hooks fails, the leader will not make the change.
+*/
+func (r *Service) UpdateWebHooks(webHooks []hooks.WebHook) (uint64, error) {
+	glog.V(2).Infof("Starting update to %d web hooks", len(webHooks))
+	json := hooks.EncodeHooksJSON(webHooks)
+	entry := storage.Entry{
+		Type:      WebHookChange,
+		Timestamp: time.Now(),
+		Data:      json,
+	}
+	return r.Propose(entry)
+}
+
+/*
+GetNodeConfig returns the current configuration of this raft node, which means
+the configuration that is currently running (as oppopsed to what
+has been proposed.
+*/
+func (r *Service) GetNodeConfig() *discovery.NodeConfig {
 	return r.nodeConfig.Load().(*discovery.NodeConfig)
 }
 
@@ -491,7 +585,7 @@ func (r *Service) setNodeConfig(newCfg *discovery.NodeConfig) error {
 	return nil
 }
 
-func (r *Service) addDiscoveredNode(id uint64, addr string) {
+func (r *Service) addDiscoveredNode(id communication.NodeID, addr string) {
 	r.latch.Lock()
 	r.discoveredNodes[id] = addr
 	r.discoveredAddresses[addr] = id
@@ -501,13 +595,13 @@ func (r *Service) addDiscoveredNode(id uint64, addr string) {
 	}
 }
 
-func (r *Service) getNodeAddress(id uint64) string {
+func (r *Service) getNodeAddress(id communication.NodeID) string {
 	r.latch.Lock()
 	defer r.latch.Unlock()
 	return r.discoveredNodes[id]
 }
 
-func (r *Service) getNodeID(address string) uint64 {
+func (r *Service) getNodeID(address string) communication.NodeID {
 	r.latch.Lock()
 	defer r.latch.Unlock()
 	return r.discoveredAddresses[address]
@@ -519,6 +613,20 @@ func (r *Service) getLocalAddress() string {
 		return ""
 	}
 	return *addr
+}
+
+/*
+GetWebHooks returns the set of WebHook configuration that is currently configured
+for this node.
+*/
+func (r *Service) GetWebHooks() []hooks.WebHook {
+	return r.webHooks.Load().([]hooks.WebHook)
+}
+
+func (r *Service) setWebHooks(h []hooks.WebHook) {
+	buf := hooks.EncodeHooks(h)
+	r.stor.SetMetadata(WebHooks, buf)
+	r.webHooks.Store(h)
 }
 
 // Used only in unit testing. Forces us to never become a leader.
@@ -541,16 +649,16 @@ func (r *Service) writeCurrentTerm(ct uint64) {
 	}
 }
 
-func (r *Service) readLastVote() uint64 {
+func (r *Service) readLastVote() communication.NodeID {
 	ct, err := r.stor.GetUintMetadata(VotedForKey)
 	if err != nil {
 		panic("Fatal error reading state from database")
 	}
-	return ct
+	return communication.NodeID(ct)
 }
 
-func (r *Service) writeLastVote(ct uint64) {
-	err := r.stor.SetUintMetadata(VotedForKey, ct)
+func (r *Service) writeLastVote(ct communication.NodeID) {
+	err := r.stor.SetUintMetadata(VotedForKey, uint64(ct))
 	if err != nil {
 		panic("Fatal error writing state to database")
 	}
@@ -572,7 +680,8 @@ func (r *Service) readLastApplied() uint64 {
 	return la
 }
 
-// Election timeout is the default timeout, plus or minus one heartbeat interval
+// Election timeout is the default timeout, plus or minus one heartbeat interval.
+// Use math.rand here, not crypto.rand, because it happens an awful lot.
 func (r *Service) randomElectionTimeout() time.Duration {
 	rge := int64(HeartbeatTimeout * 2)
 	min := int64(ElectionTimeout - HeartbeatTimeout)
@@ -582,10 +691,24 @@ func (r *Service) randomElectionTimeout() time.Duration {
 }
 
 /*
- * Make a random-number generator for timeouts and for generating node IDs. Nanosecond
- * accuracy should be random enough for the seed.
- */
+Use the crypto random number generator to initialize the regular one.
+The regular one is just used to randomize election timeouts.
+If we don't seed the generator, then a bunch of nodes won't get their
+timeouts in a random way. But use a new generator here because the default
+one might be used for various testing frameworks. Finally, be aware that
+the non-default generator is not thread-safe!
+*/
 func makeRand() *rand.Rand {
-	s := rand.NewSource(time.Now().UnixNano())
+	s := rand.NewSource(randomInt64())
 	return rand.New(s)
+}
+
+var maxBigInt = big.NewInt(math.MaxInt64)
+
+func randomInt64() int64 {
+	ri, err := cryptoRand.Int(cryptoRand.Reader, maxBigInt)
+	if err != nil {
+		panic(err.Error())
+	}
+	return ri.Int64()
 }

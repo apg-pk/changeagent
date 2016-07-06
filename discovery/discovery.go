@@ -21,8 +21,8 @@ list of Nodes. Under normal operation, only the "new" list is available. During 
 change, both lists are set and we are in a mode of joint consensus.
 */
 type NodeList struct {
-	New []string
-	Old []string
+	New []string `json:"new,omitempty"`
+	Old []string `json:"old,omitempty"`
 }
 
 /*
@@ -31,8 +31,8 @@ implementation. It includes both the current and previous node lists. We use thi
 we need to backtrack in the history and restore an old set of node configuration.
 */
 type NodeConfig struct {
-	Current  *NodeList
-	Previous *NodeList
+	Current  *NodeList `json:"current,omitempty"`
+	Previous *NodeList `json:"previous,omitempty"`
 }
 
 /*
@@ -45,6 +45,14 @@ type Discovery interface {
 	 * config.
 	 */
 	GetCurrentConfig() *NodeConfig
+
+	/*
+	 * If this method returns true, then the implementation only supports a single
+	 * stand-alone node. In that case, configuration changes will never be delivered.
+	 * This will only be true if the service has a single node and it will never
+	 * have anything other than a single node.
+	 */
+	IsStandalone() bool
 
 	/*
 	 * Return a channel that will be notified whenever the configuration changes.

@@ -7,6 +7,7 @@ package raft
 import (
 	"github.com/30x/changeagent/communication"
 	"github.com/30x/changeagent/discovery"
+	"github.com/30x/changeagent/hooks"
 	"github.com/30x/changeagent/storage"
 	"github.com/golang/glog"
 )
@@ -179,7 +180,7 @@ func (r *Service) appendEntries(entries []storage.Entry) error {
 		}
 		glog.V(2).Infof("Applying a new configuration %s", newCfg)
 
-		curCfg := r.getNodeConfig()
+		curCfg := r.GetNodeConfig()
 		newCfg.Previous = curCfg.Current
 		r.setNodeConfig(newCfg)
 		glog.Info("Applied a new node configuration from the master")
@@ -188,6 +189,13 @@ func (r *Service) appendEntries(entries []storage.Entry) error {
 	}
 
 	return nil
+}
+
+func (r *Service) invokeWebHooks(newEntry *storage.Entry) error {
+	cfg := r.GetWebHooks()
+	glog.V(2).Infof("Invoking %d web hooks", len(cfg))
+	// TODO pass the content type from somewhere?
+	return hooks.Invoke(cfg, newEntry.Data, jsonContent)
 }
 
 func (r *Service) makeProposal(newEntry *storage.Entry, state *raftState) (uint64, error) {

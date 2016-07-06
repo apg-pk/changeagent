@@ -89,29 +89,31 @@ hold the actual change data:
 Retrieve the first 100 changes since the beginning of time:
 
     curl http://localhost:9000/changes
-    [{"_id": 2,"_ts": 1464804748947570788,"data": {"Hello": "world"}}]
+    {"changes":[{"_id": 2,"_ts": 1464804748947570788,"data": {"Hello": "world"}}],"atStart":true,"atEnd":true}
 
 ... now we'll post a few more changes ...
 
 Retrieve only the changes since change 12:
 
     curl http://localhost:9000/changes?since=12
-    [{"_id":13,"_ts":1464805001822543303,"data":{"Hello":"world","seq":10}},
+    {"changes":[{"_id":13,"_ts":1464805001822543303,"data":{"Hello":"world","seq":10}},
     {"_id":14,"_ts":1464805003646294078,"data":{"Hello":"world","seq":11}},
-    {"_id":15,"_ts":1464805005509406435,"data":{"Hello":"world","seq":12}}]
+    {"_id":15,"_ts":1464805005509406435,"data":{"Hello":"world","seq":12}}],
+    "atStart":false,"atEnd":true}
 
 Retrieve the changes since change 15, and wait for up to 120 seconds for a
 new change to be posted. (And while this API call is running, post a new change
 by POSTing to the "/changes" URI:
 
     $ curl "http://localhost:9000/changes?since=15&block=120"
-    [{"_id":16,"_ts":1464805113553316620,"data":{"Hello":"World","seq":13}}]
+    {"changes":[{"_id":16,"_ts":1464805113553316620,"data":{"Hello":"World","seq":13}}],
+    "atStart":false,"atEnd":true}
 
 Now ask again for the changes since change 16, but this time don't post anything
 new:
 
     $ curl "http://localhost:9000/changes?since=16&block=5"
-    []
+    {"changes":[],"atStart":false,"atEnd":true}
 
 Post a change that includes two tags:
 
@@ -122,8 +124,47 @@ Post a change that includes two tags:
 Retrieve up to 10 changes including only ones that have the tag "testTag":
 
     curl "http://localhost:9000/changes?limit=10&tag=testTag"
-    [{"_id":17,"_ts":1464805241291100178,
-      "tags":["testTag","testTag2"],"data":{"Hello":"world","seq":12}}
+    {"changes":[{"_id":17,"_ts":1464805241291100178,
+      "tags":["testTag","testTag2"],"data":{"Hello":"world","seq":12}}],
+      "atStart":true,"atEnd":true}
+
+# Web Hook Support
+
+changeagent supports optional web hooks. These web hooks are designed to support
+use cases in which we wish to validate a set of changes before putting them
+in the change log. They can also be used to update another system, and ensure
+that a record is placed in the change log only if that update succeeds.
+
+In other words, changeagent supports an optional list of URIs that the leader will
+invoke before submitting any change to the distributed log.
+
+Register a single web hook at "localhost:9010":
+
+    curl http://localhost:9000/hooks \
+    -H "Content-Type: application/json" \
+    -d '[{"uri":"http://localhost:9010"}]'
+
+Once a web hook is registered, then the leader will invoke the specified URI
+before making any change. If the web hook returns anything other than a
+"20x" response, (i.e. anything >= 200 and < 300) then the change will fail.
+
+Web Hooks also support headers. For example, the hook below passes the
+"X-Apigee-Test" header on every request.
+
+    curl http://localhost:9000/hooks \
+    -H "Content-Type: application/json" \
+    -d [{"uri":"http://localhost:9010", "headers":{"X-Apigee-Test":"ing"}}]'
+
+Note that the data passed in to the "/hooks" URI is an array. That way the server
+can support more than one webhook. If more than one webhook is configured, then the
+leader will invoke all the webhooks, in parallel, before making any change. If
+any one webhook returns an error, then the change will be aborted.
+
+To change the webhook configuration, POST to "/hooks" again. To delete all
+webhooks, DELETE the same path.
+
+Webhook configuration is persisted across the cluster and is available on all
+nodes after a restart.
 
 # Building
 
@@ -173,12 +214,12 @@ In addition, there are a few other top-level targets:
 To run a standalone node, you will need to pass a port and a directory to
 store the data.
 
-The binary "agent" will have been built by "make" in the "agent" subdirectory.
+The binary "changeagent" will have been built by "make" in the "agent" subdirectory.
 
 For instance, here is a simple way to run on port 9000:
 
     mkdir data
-    ./agent/agent -p 9000 -d ./data -logtostderr
+    ./changeagent -p 9000 -d ./data -logtostderr
 
 ## Running a Cluster
 
@@ -191,14 +232,14 @@ For instance, create a file called "nodes" that contains the following:
     localhost:9001
     localhost:9002
 
-Then, start three "agent" binaries:
+Then, start three "changeagent" binaries:
 
     mkdir data1
     mkdir data2
     mkdir data3
-    ./agent/agent -p 9000 -d ./data1 -logtostderr -s nodes &
-    ./agent/agent -p 9001 -d ./data2 -logtostderr -s nodes &
-    ./agent/agent -p 9002 -d ./data3 -logtostderr -s nodes &
+    ./changeagent -p 9000 -d ./data1 -logtostderr -s nodes &
+    ./changeagent -p 9001 -d ./data2 -logtostderr -s nodes &
+    ./changeagent -p 9002 -d ./data3 -logtostderr -s nodes &
 
 After about 10 seconds, the three agents will agree on a leader, and you will
 be able to make API calls to any cluster node.
